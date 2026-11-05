@@ -31,6 +31,9 @@ concurrency:
   group: package-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  UNIXNU_REF: 13e5973748a8447cbb90520c9a2dd5e65e272435 # Last UniXNU commit with all submodules pushed to GitHub
+
 jobs:
   package:
     runs-on: macos-26
@@ -43,9 +46,48 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: UniXNU/UniXNU
-          ref: 82b847c4ac3f68a57024b3082ffa3a03442defd9 # Wi-Fi runtime and Data firmware integration
+          ref: ${{ env.UNIXNU_REF }}
           path: UniXNU
           submodules: recursive
+      - name: apply upstream launchd cache truncation and keystore/prelink fixes
+        run: |
+          git -C UniXNU/drivers/AppleKeyStoreState fetch --depth=1 origin 8c70daf814aafdf4a3d35e40dde0322655fd0a83
+          git -C UniXNU/drivers/AppleKeyStoreState checkout --detach 8c70daf814aafdf4a3d35e40dde0322655fd0a83
+          git -C UniXNU/kits/XnuPrelink fetch --depth=1 origin ef4fe4f9ec59faa04eba24025bac0fa2985dbe5b
+          git -C UniXNU/kits/XnuPrelink checkout --detach ef4fe4f9ec59faa04eba24025bac0fa2985dbe5b
+          python3 - <<'PY'
+          import pathlib
+          for rel in ('patches/xnu-12377/zzy-native-gpu-addon-mount.patch', 'patches/xnu/zzy-native-gpu-addon-mount.patch'):
+              p = pathlib.Path('UniXNU') / rel
+              t = p.read_text()
+              t = t.replace(',321 @@ uint64_t native_owner_data_seed_base', ',323 @@ uint64_t native_owner_data_seed_base', 1)
+              old_attr = '+\t\tVATTR_SET(&va, va_mode, mode);\n+\t\terror = vnode_setattr(vp, &va, ctx);'
+              new_attr = '+\t\tVATTR_SET(&va, va_mode, mode);\n+\t\t/* Kernel vnode_open does not finish O_TRUNC on the non-compound path. */\n+\t\tVATTR_SET(&va, va_data_size, size);\n+\t\terror = vnode_setattr(vp, &va, ctx);'
+              assert old_attr in t, f'missing target in {rel}'
+              p.write_text(t.replace(old_attr, new_attr, 1))
+              print(f'patched {rel} with va_data_size truncation fix')
+          comp = pathlib.Path('UniXNU/components.toml')
+          ct = comp.read_text()
+          for old_rev, new_rev in [
+              ('42ff83e08b2265fe741d4adaf084bebe003452ba', '8c70daf814aafdf4a3d35e40dde0322655fd0a83'),
+              ('b74ed7c74a07f0eb5f81089c660905ecc4cabb7f', 'ef4fe4f9ec59faa04eba24025bac0fa2985dbe5b'),
+              ('f6bf561f92cc42761bdd417fce1d53fe1db9477c', '28de7b91d7a880682b777e0e3564245a99dbc3f5'),
+          ]:
+              assert old_rev in ct, f'missing {old_rev} in components.toml'
+              ct = ct.replace(old_rev, new_rev, 1)
+          comp.write_text(ct)
+          print('updated components.toml revisions')
+          p = pathlib.Path('UniXNU/patches/mesa/turnip-frame-diagnostics.patch')
+          t = p.read_text()
+          head = 'diff --git a/src/freedreno/vulkan/tu_frame_diagnostic.h b/src/freedreno/vulkan/tu_frame_diagnostic.h\n'
+          old = head + '--- /dev/null\n'
+          new = head + 'new file mode 100644\n--- /dev/null\n'
+          if old in t:
+              p.write_text(t.replace(old, new, 1))
+              print('patched missing new file mode header')
+          else:
+              print('header already valid, nothing to do')
+          PY
       - uses: actions/checkout@v4
         with:
           repository: UniXNU/uefi-sheng
@@ -122,6 +164,47 @@ jobs:
           if not path.is_file() and os.environ['INIT_DATA'] != 'true':
               raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
           PY
+      - name: restore GPU build intermediates
+        id: gpu-cache
+        if: inputs.os == '27'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            UniXNU/.cache/mesa-work
+            UniXNU/.cache/mesa-venv
+            UniXNU/.cache/gpu-reference/metal2vulkan
+            UniXNU/build/mesa-tu-ios27
+            UniXNU/build/adreno-metal-bridge
+            UniXNU/build/m2v-target
+            device/drivers/Ath12kWifi/deps
+          key: gpu-build-v3-${{ inputs.os }}-${{ hashFiles('UniXNU/scripts/data/adreno-compiler-inputs.json', 'UniXNU/scripts/data/gpu-metal-vulkan-inputs.json', 'UniXNU/patches/mesa/**', 'UniXNU/drivers/AdrenoMetal/bridge/patches/**', 'device/drivers/Ath12kWifi/tools/source-lock.json') }}
+      - name: prepare WCN7850 firmware and Ath12kWifi sources
+        if: inputs.os == '27'
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, urllib.request
+          fw_dir = pathlib.Path('device/firmware/wcn7850')
+          manifest = json.loads((fw_dir / 'manifest.json').read_text())['files']
+          base_url = 'https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/ath12k/WCN7850/hw2.0/'
+          for name, expected in manifest.items():
+              dest = fw_dir / name
+              if not dest.is_file() or hashlib.sha256(dest.read_bytes()).hexdigest() != expected['sha256']:
+                  print(f'Downloading {name}...')
+                  with urllib.request.urlopen(base_url + name, timeout=120) as resp:
+                      data = resp.read()
+                  if len(data) != expected['bytes'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
+                      raise SystemExit(f'{name} size or SHA-256 mismatch')
+                  dest.write_bytes(data)
+              print(f'Verified {name}: {expected["bytes"]} bytes, sha256={expected["sha256"]}')
+          # Git 2.48+ defaults sparse checkouts to cone mode, which refuses the file patterns of the source lock.
+          fs = pathlib.Path('device/drivers/Ath12kWifi/tools/fetch-sources.py')
+          text = fs.read_text()
+          old = '"sparse-checkout", "add"'
+          if old in text:
+              fs.write_text(text.replace(old, '"sparse-checkout", "set", "--no-cone"', 1))
+              print('patched fetch-sources.py for non-cone sparse checkout')
+          PY
+          bash device/drivers/Ath12kWifi/tools/fetch-sources.sh
       - name: package
         working-directory: device
         env:
@@ -135,6 +218,19 @@ jobs:
             args+=(--init-data)
           fi
           scripts/package.sh "${args[@]}"
+      - name: save GPU build intermediates
+        if: always() && inputs.os == '27' && steps.gpu-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/build/mesa-tu-ios27/src/freedreno/vulkan/libvulkan_freedreno.dylib') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            UniXNU/.cache/mesa-work
+            UniXNU/.cache/mesa-venv
+            UniXNU/.cache/gpu-reference/metal2vulkan
+            UniXNU/build/mesa-tu-ios27
+            UniXNU/build/adreno-metal-bridge
+            UniXNU/build/m2v-target
+            device/drivers/Ath12kWifi/deps
+          key: gpu-build-v3-${{ inputs.os }}-${{ hashFiles('UniXNU/scripts/data/adreno-compiler-inputs.json', 'UniXNU/scripts/data/gpu-metal-vulkan-inputs.json', 'UniXNU/patches/mesa/**', 'UniXNU/drivers/AdrenoMetal/bridge/patches/**', 'device/drivers/Ath12kWifi/tools/source-lock.json') }}
       - uses: actions/cache/save@v4
         if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
         with:
@@ -147,7 +243,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: installation-seed-${{ inputs.os }}
-          retention-days: 1
+          retention-days: 3
           path: |
             UniXNU/out/sheng/*/*/runtime/data.dbr
             UniXNU/out/sheng/*/*/runtime/inputs.json
@@ -155,7 +251,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: images-${{ inputs.os }}
-          retention-days: 1
+          retention-days: 3
           if-no-files-found: error
           path: |
             UniXNU/out/sheng/*/*/boot/boot.img
